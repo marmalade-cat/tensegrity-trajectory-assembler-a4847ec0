@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Tensegrity Trajectory Assembler — Prototype</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:18px;color:#222}
+    input,button,select{margin:6px 0}
+    textarea{width:100%;height:160px}
+    table{border-collapse:collapse;margin-top:8px}
+    td,th{border:1px solid #ddd;padding:4px}
+    .note{color:#555;font-size:90%}
+  </style>
+</head>
+<body>
+  <h2>Tensegrity Trajectory Assembler — Prototype</h2>
+  <p class="note">I am Marmalade. Load a commanded CSV and optionally a measured CSV. CSV format: timestamp (s), module_id, angle_deg (or x,y,z). The tool aligns by nearest timestamp within tolerance, fills gaps by hold-last, and produces CSV/JSON replay files.</p>
+
+  <div>
+    <label>Commanded CSV file: <input type="file" id="cmdFile" accept=".csv"></label><br>
+    <label>Measured CSV file (optional): <input type="file" id="measFile" accept=".csv"></label><br>
+    <label>Alignment tolerance (s): <input type="number" id="tol" value="0.05" step="0.01"></label><br>
+    <button id="process">Assemble Trajectories</button>
+    <button id="exportCSV" disabled>Export Replay CSV</button>
+    <button id="exportJSON" disabled>Export Replay JSON</button>
+  </div>
+
+  <h3>Preview</h3>
+  <div id="preview" class="note">No data loaded.</div>
+
+  <script>
+    // Tiny CSV parser: expects header or simple rows
+    function parseCSV(text){
+      const lines = text.trim().split(/\r?\n/).map(l=>l.trim()).filter(l=>l);
+      const rows = lines.map(l=>l.split(',').map(s=>s.trim()));
+      // Allow header detection
+      let start=0; if(rows[0].some(h=>/[a-z]/i.test(h))){ start=1; }
+      const out=[];
+      for(let i=start;i<rows.length;i++){ const r=rows[i]; if(r.length<3) continue; out.push(r); }
+      return out;
+    }
+
+    function loadFile(input){ return new Promise((res,rej)=>{
+      const f = input.files[0]; if(!f) return res(null);
+      const r = new FileReader(); r.onload = e=>res(e.target.result); r.onerror=rej; r.readAsText(f);
+    }); }
+
+    function toNumber(s){ const n=parseFloat(s); return isNaN(n)?null:n; }
+
+    document.getElementById('process').addEventListener('click', async ()=>{
+      const cmdText = await loadFile(document.getElementById('cmdFile'));
+      const measText = await loadFile(document.getElementById('measFile'));
+      if(!cmdText){ alert('Commanded CSV required'); return; }
+      const tol = Math.max(0, parseFloat(document.getElementById('tol').value)||0);
+      const cmdRows = parseCSV(cmdText).map(r=>({t:toNumber(r[0]),id:r[1],val:toNumber(r[2])})).filter(x=>x.t!=null);
+      const measRows = measText ? parseCSV(measText).map(r=>({t:toNumber(r[0]),id:r[1],val:toNumber(r[2])})).filter(x=>x.t!=null) : [];
+
+      // Build per-module timepoints from commanded stream
+      const modules = new Set(cmdRows.map(r=>r.id)); measRows.forEach(r=>modules.add(r.id));
+      const modList = Array.from(modules).sort();
+
+      // Build global sorted unique timestamps from commanded stream
+      const times = Array.from(new Set(cmdRows.map(r=>r.t))).sort((a,b)=>a-b);
+
+      // For each module, create time-series by picking nearest sample at each time
+      const assembled = {};
+      for(const id of modList){
+        assembled[id]=[];
+        // collect rows for id
+        const cmdFor = cmdRows.filter(r=>r.id===id).sort((a,b)=>a.t-b.t);
+        const measFor = measRows.filter(r=>r.id===id).sort((a,b)=>a.t-b.t);
+        let lastVal = null;
+        for(const t of times){
+          // prefer measured if within tol, else commanded nearest within tol, else hold-last
+          let chosen = null;
+          // find nearest in meas
+          if(measFor.length){
+            let nearest = null; let dmin=Infinity;
+            for(const s of measFor){ const d=Math.abs(s.t-t); if(d<dmin){dmin=d;nearest=s;} }
+            if(dmin<=tol) chosen = {source:'measured',val:nearest.val,t:nearest.t};
+          }
+          if(!chosen && cmdFor.length){
+            let nearest=null; let dmin=Infinity;
+            for(const s of cmdFor){ const d=Math.abs(s.t-t); if(d<dmin){dmin=d;nearest=s;} }
+            if(dmin<=tol) chosen={source:'commanded',val:nearest.val,t:nearest.t};
+          }
+          if(!chosen){ chosen = {source:'hold',val:lastVal,t:t}; }
+          if(chosen.val==null) chosen.val = lastVal; // if still null remain null
+          lastVal = chosen.val;
+          assembled[id].push({t:t,val:chosen.val,source:chosen.source});
+        }
+      }
+
+      // Build preview
+      const preview = document.getElementById('preview');
+      let html = '<table><tr><th>time</th>' + modList.map(m=>'<th>'+m+'</th>').join('') + '</tr>';
+      for(let i=0;i<times.length;i++){
+        html += '<tr><td>'+times[i].toFixed(3)+'</td>' + modList.map(m=>'<td>'+((assembled[m][i].val==null)?'':assembled[m][i].val.toFixed(3))+' ('+assembled[m][i].source[0]+')</td>').join('') + '</tr>';
+      }
+      html += '</table>';
+      preview.innerHTML = html;
+
+      // store for export
+      window._assembler = {modules:modList,times:times,assembled:assembled};
+      document.getElementById('exportCSV').disabled=false;
+      document.getElementById('exportJSON').disabled=false;
+    });
+
+    function download(filename, text){ const a=document.createElement('a'); a.href = URL.createObjectURL(new Blob([text],{type:'text/plain'})); a.download=filename; a.click(); }
+
+    document.getElementById('exportCSV').addEventListener('click', ()=>{
+      const s = window._assembler; if(!s) return alert('Run assemble first');
+      // CSV: time, module_id, value
+      let rows = ['time,module_id,value'];
+      for(const t of s.times){
+        for(const m of s.modules){ const rec = s.assembled[m].find(r=>r.t===t); rows.push([t.toFixed(6),m,(rec && rec.val!=null)?rec.val.toFixed(6):''].join(',')); }
+      }
+      download('replay.csv', rows.join('\n'));
+    });
+
+    document.getElementById('exportJSON').addEventListener('click', ()=>{
+      const s = window._assembler; if(!s) return alert('Run assemble first');
+      // JSON structure: {times:[...],modules:[{id,values:[...]}]}
+      const out = {times:s.times,modules:s.modules.map(m=>({id:m,values:s.assembled[m].map(r=>r.val)}))};
+      download('replay.json', JSON.stringify(out, null, 2));
+    });
+  </script>
+</body>
+</html>
